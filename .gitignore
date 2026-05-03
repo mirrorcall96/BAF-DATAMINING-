@@ -1,0 +1,19 @@
+# Ignore everything by default
+*
+
+# Allow descent into directories
+!*/
+
+# Allow source code + project files
+!.gitignore
+!README.md
+!requirements.txt
+!main.py
+!src/**/*.py
+
+# Exclude the reports sub-package — not needed for running the pipeline
+src/reports/
+
+# Re-ignore caches inside src/
+__pycache__/
+*.pyc
