@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Literal
 
+import os
+
 from sklearn.ensemble import (
     AdaBoostClassifier, HistGradientBoostingClassifier, RandomForestClassifier,
 )
@@ -28,9 +30,42 @@ from sklearn.svm import LinearSVC
 from sklearn.tree import DecisionTreeClassifier
 from xgboost import XGBClassifier
 
+# Optional imports — wrapped in try/except so the module loads even on
+# servers without these libraries. Each model checks availability at build time.
+try:
+    from lightgbm import LGBMClassifier
+    HAS_LGBM = True
+except ImportError:
+    HAS_LGBM = False
+
+try:
+    from catboost import CatBoostClassifier
+    HAS_CATBOOST = True
+except ImportError:
+    HAS_CATBOOST = False
+
+try:
+    from imblearn.ensemble import (
+        BalancedRandomForestClassifier, EasyEnsembleClassifier,
+    )
+    HAS_IMBLEARN_ENSEMBLE = True
+except ImportError:
+    HAS_IMBLEARN_ENSEMBLE = False
+
 from .config import (
-    HP_ANN, HP_DT, HP_RF, HP_SVM, HP_XGB, NEEDS_SCALING, RANDOM_STATE,
+    HP_ANN, HP_CATBOOST, HP_DT, HP_LGBM, HP_RF, HP_SVM, HP_XGB, NEEDS_SCALING, RANDOM_STATE,
 )
+
+
+def _gpu_available() -> bool:
+    """Cheap detection: check for `nvidia-smi` exit code 0."""
+    if os.environ.get("FORCE_CPU", "").lower() in {"1", "true", "yes"}:
+        return False
+    return os.system("nvidia-smi >/dev/null 2>&1") == 0
+
+
+GPU_AVAILABLE = _gpu_available()
+
 
 # Extended models for the Base-only deep sweep (`extended_base.py`)
 ModelName = Literal[
@@ -41,6 +76,9 @@ ModelName = Literal[
     "RF", "RF-200",
     "XGBoost", "XGBoost-tuned", "XGBoost-CS",
     "AdaBoost", "HistGB",
+    "LightGBM", "LightGBM-bal",
+    "CatBoost",
+    "BalancedRF", "EasyEnsemble",
 ]
 EXTENDED_NEEDS_SCALING = NEEDS_SCALING | {"ANN-deep"}
 
@@ -98,15 +136,59 @@ def _make_estimator(name: str, n_pos: int, n_neg: int, cost_sensitive: bool):
         # Newer sklearn (>=1.6) dropped the `algorithm` kwarg; SAMME is now the only option
         return AdaBoostClassifier(
             estimator=DecisionTreeClassifier(max_depth=3, random_state=RANDOM_STATE),
-            n_estimators=100, learning_rate=0.5,
+            n_estimators=200, learning_rate=0.5,
             random_state=RANDOM_STATE,
         )
     if name == "HistGB":
         return HistGradientBoostingClassifier(
-            max_iter=200, max_depth=8, learning_rate=0.1,
+            max_iter=300, max_depth=8, learning_rate=0.1,
+            early_stopping=True, validation_fraction=0.1, n_iter_no_change=20,
             class_weight=("balanced" if cost_sensitive else None),
             random_state=RANDOM_STATE,
         )
+
+    if name in ("LightGBM", "LightGBM-bal"):
+        if not HAS_LGBM:
+            raise RuntimeError("lightgbm is not installed (`pip install lightgbm`)")
+        kwargs = dict(HP_LGBM)
+        if name == "LightGBM-bal" or cost_sensitive:
+            kwargs["class_weight"] = "balanced"
+        if GPU_AVAILABLE:
+            kwargs["device"] = "gpu"
+            kwargs["gpu_use_dp"] = False
+        return LGBMClassifier(**kwargs, random_state=RANDOM_STATE)
+
+    if name == "CatBoost":
+        if not HAS_CATBOOST:
+            raise RuntimeError("catboost is not installed (`pip install catboost`)")
+        kwargs = dict(HP_CATBOOST)
+        kwargs["auto_class_weights"] = "Balanced" if cost_sensitive else None
+        if GPU_AVAILABLE:
+            kwargs["task_type"] = "GPU"
+            kwargs["devices"] = "0"
+        return CatBoostClassifier(**kwargs, random_state=RANDOM_STATE)
+
+    if name == "BalancedRF":
+        if not HAS_IMBLEARN_ENSEMBLE:
+            raise RuntimeError("imbalanced-learn ensemble module not available")
+        return BalancedRandomForestClassifier(
+            n_estimators=300, max_depth=20, min_samples_leaf=10,
+            sampling_strategy="not minority", replacement=True, bootstrap=False,
+            n_jobs=-1, random_state=RANDOM_STATE,
+        )
+
+    if name == "EasyEnsemble":
+        if not HAS_IMBLEARN_ENSEMBLE:
+            raise RuntimeError("imbalanced-learn ensemble module not available")
+        return EasyEnsembleClassifier(
+            n_estimators=10,
+            estimator=AdaBoostClassifier(
+                estimator=DecisionTreeClassifier(max_depth=3, random_state=RANDOM_STATE),
+                n_estimators=100, learning_rate=0.5, random_state=RANDOM_STATE,
+            ),
+            n_jobs=-1, random_state=RANDOM_STATE,
+        )
+
     raise ValueError(f"Unknown model: {name!r}")
 
 

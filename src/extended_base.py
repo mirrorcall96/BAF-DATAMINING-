@@ -44,8 +44,10 @@ warnings.filterwarnings("ignore")
 # Sweep configuration
 # ---------------------------------------------------------------------------
 EXT_VARIANT = "Base"  # this sweep is Base-only
-EXT_IMBALANCE = ["none", "smote", "adasyn", "smoteenn", "smotetomek", "undersample"]
-EXT_FS = ["all", "mi", "ga", "rfe"]
+EXT_IMBALANCE = [
+    "none", "smote", "smote_nc", "adasyn", "smoteenn", "smotetomek", "undersample",
+]
+EXT_FS = ["all", "mi", "ga", "rfe", "mrmr", "boruta", "permutation"]
 EXT_MODELS = [
     "DT", "DT-shallow",
     "SVM",
@@ -54,12 +56,34 @@ EXT_MODELS = [
     "RF", "RF-200",
     "XGBoost", "XGBoost-tuned",
     "AdaBoost", "HistGB",
+    "LightGBM", "LightGBM-bal",
+    "CatBoost",
+    "BalancedRF", "EasyEnsemble",
 ]
 
 EXT_RESULTS = OUTPUT_DIR / "results_extended.parquet"
 EXT_FEATURE_CACHE = OUTPUT_DIR / "feature_cache_extended.json"
 EXT_RUNS_DIR = OUTPUT_DIR / "runs"
 EXT_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _partition_paths(partition_id: int | None, partition_total: int | None):
+    """Per-partition output paths so multiple servers don't write to the same file."""
+    if partition_id is None:
+        return EXT_RESULTS, EXT_FEATURE_CACHE, EXT_RUNS_DIR
+    suffix = f"_partition_{partition_id}_of_{partition_total}"
+    res = OUTPUT_DIR / f"results_extended{suffix}.parquet"
+    cache = OUTPUT_DIR / f"feature_cache_extended{suffix}.json"
+    runs = OUTPUT_DIR / f"runs{suffix}"
+    runs.mkdir(parents=True, exist_ok=True)
+    return res, cache, runs
+
+
+def _belongs_to_partition(idx: int, partition_id: int | None, partition_total: int | None) -> bool:
+    """Index-based partitioning: cell `idx` belongs to my partition if idx % total == id-1."""
+    if partition_id is None:
+        return True
+    return (idx % partition_total) == (partition_id - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -174,16 +198,31 @@ def print_row(row: dict) -> None:
     )
 
 
-def run(limit: int | None = None) -> None:
+def run(limit: int | None = None,
+         partition_id: int | None = None,
+         partition_total: int | None = None) -> None:
+    # Per-partition output paths
+    global EXT_RESULTS, EXT_FEATURE_CACHE, EXT_RUNS_DIR
+    EXT_RESULTS, EXT_FEATURE_CACHE, EXT_RUNS_DIR = _partition_paths(partition_id, partition_total)
+
     feature_cache = load_feature_cache()
     prep_dir = PREPROCESSED_DIR / EXT_VARIANT
     if not prep_dir.exists():
         raise FileNotFoundError(f"Preprocessed Base data not found at {prep_dir} — run prep.py first")
 
-    print("=" * 78)
-    print(f"  EXTENDED BASE SWEEP  ({len(EXT_IMBALANCE)} x {len(EXT_FS)} x {len(EXT_MODELS)} = "
-          f"{len(EXT_IMBALANCE) * len(EXT_FS) * len(EXT_MODELS)} cells)")
-    print("=" * 78)
+    total_cells = len(EXT_IMBALANCE) * len(EXT_FS) * len(EXT_MODELS)
+    if partition_id is not None:
+        my_cells = sum(1 for i in range(total_cells) if _belongs_to_partition(i, partition_id, partition_total))
+        print("=" * 78)
+        print(f"  EXTENDED BASE SWEEP — partition {partition_id}/{partition_total}")
+        print(f"  This server runs {my_cells} of {total_cells} cells")
+        print(f"  Results → {EXT_RESULTS.name}")
+        print("=" * 78)
+    else:
+        print("=" * 78)
+        print(f"  EXTENDED BASE SWEEP  ({len(EXT_IMBALANCE)} x {len(EXT_FS)} x {len(EXT_MODELS)} = "
+              f"{total_cells} cells)")
+        print("=" * 78)
 
     X_train = pd.read_parquet(prep_dir / "X_train.parquet")
     y_train = pd.read_parquet(prep_dir / "y_train.parquet").iloc[:, 0]
@@ -195,29 +234,69 @@ def run(limit: int | None = None) -> None:
 
     n_done = 0
     n_run = 0
+    n_skipped_partition = 0
+    cell_idx = -1
 
     for imbalance in EXT_IMBALANCE:
+        # Skip resample work entirely if no cell of this imbalance belongs to my partition
+        my_in_imb = False
+        for fs in EXT_FS:
+            for model_name in EXT_MODELS:
+                cell_idx_check = (
+                    EXT_IMBALANCE.index(imbalance) * len(EXT_FS) * len(EXT_MODELS)
+                    + EXT_FS.index(fs) * len(EXT_MODELS)
+                    + EXT_MODELS.index(model_name)
+                )
+                if _belongs_to_partition(cell_idx_check, partition_id, partition_total):
+                    my_in_imb = True
+                    break
+            if my_in_imb:
+                break
+        if not my_in_imb:
+            cell_idx += len(EXT_FS) * len(EXT_MODELS)
+            continue
+
         t0 = time.time()
         try:
             X_imb, y_imb = resample(X_train, y_train, imbalance, dummy_prefixes=DUMMY_PREFIXES)
         except Exception as e:
             print(f"\n[!] {imbalance} resample failed: {type(e).__name__}: {e}")
+            cell_idx += len(EXT_FS) * len(EXT_MODELS)
             continue
         print(f"\n[{EXT_VARIANT} | {imbalance:11s}] resampled to {X_imb.shape} "
               f"(pos={int(y_imb.sum())}) in {time.time()-t0:.1f}s")
 
         for fs in EXT_FS:
+            # Same FS-skip optimisation
+            my_in_fs = any(
+                _belongs_to_partition(
+                    EXT_IMBALANCE.index(imbalance) * len(EXT_FS) * len(EXT_MODELS)
+                    + EXT_FS.index(fs) * len(EXT_MODELS) + i,
+                    partition_id, partition_total,
+                )
+                for i in range(len(EXT_MODELS))
+            )
+            if not my_in_fs:
+                cell_idx += len(EXT_MODELS)
+                continue
+
             try:
                 selected = get_features(feature_cache, EXT_VARIANT, imbalance, fs,
                                          X_imb, y_imb, all_cols)
             except Exception as e:
                 print(f"  [!] FS {fs} failed: {type(e).__name__}: {e}")
+                cell_idx += len(EXT_MODELS)
                 continue
 
             print(f"  [{imbalance:11s} | {fs:4s} | |F|={len(selected)}]")
             print(ROW_HEADER)
 
             for model_name in EXT_MODELS:
+                cell_idx += 1
+                if not _belongs_to_partition(cell_idx, partition_id, partition_total):
+                    n_skipped_partition += 1
+                    continue
+
                 results = load_results()
                 if already_done(
                     results, variant=EXT_VARIANT, imbalance=imbalance,
@@ -241,15 +320,24 @@ def run(limit: int | None = None) -> None:
                 except Exception as e:
                     print(f"  {model_name:<14s} [ERR] {type(e).__name__}: {e}")
 
-    print(f"\nFinished. Newly trained: {n_run}. Already done (skipped): {n_done}.")
+    print(f"\nFinished. Newly trained: {n_run}. Already done (skipped): {n_done}. "
+          f"Other-partition skipped: {n_skipped_partition}.")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None,
                     help="stop after this many newly trained models")
+    ap.add_argument("--partition", type=str, default=None,
+                    help='partition ID over total servers, e.g. "1/3" = "I am server 1 of 3"')
     args = ap.parse_args()
-    run(limit=args.limit)
+
+    partition_id = partition_total = None
+    if args.partition:
+        partition_id, partition_total = (int(x) for x in args.partition.split("/"))
+        assert 1 <= partition_id <= partition_total, "partition must satisfy 1 <= id <= total"
+
+    run(limit=args.limit, partition_id=partition_id, partition_total=partition_total)
 
 
 if __name__ == "__main__":

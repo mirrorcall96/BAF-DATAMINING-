@@ -101,16 +101,27 @@ GA_FITNESS_CV_FOLDS = 3
 # Classifier hyperparameters
 # ---------------------------------------------------------------------------
 HP_DT = dict(max_depth=12, min_samples_leaf=50)
-HP_SVM = dict(C=1.0, max_iter=2000, dual="auto")
+HP_SVM = dict(C=1.0, max_iter=5000, dual="auto")
 HP_ANN = dict(
     hidden_layer_sizes=(64, 32), activation="relu", solver="adam",
-    learning_rate_init=1e-3, batch_size=512, max_iter=30,
-    early_stopping=True, validation_fraction=0.1, n_iter_no_change=5,
+    learning_rate_init=1e-3, batch_size=512, max_iter=100,
+    early_stopping=True, validation_fraction=0.1, n_iter_no_change=10,
 )
-HP_RF = dict(n_estimators=100, max_depth=15, min_samples_leaf=20, n_jobs=-1)
+HP_RF = dict(n_estimators=200, max_depth=15, min_samples_leaf=20, n_jobs=-1)
 HP_XGB = dict(
-    n_estimators=200, max_depth=6, learning_rate=0.1,
+    n_estimators=500, max_depth=6, learning_rate=0.1,
     tree_method="hist", n_jobs=-1, eval_metric="auc", verbosity=0,
+)
+HP_LGBM = dict(
+    n_estimators=1000, learning_rate=0.05, num_leaves=64,
+    min_child_samples=20, n_jobs=-1, verbosity=-1,
+)
+HP_CATBOOST = dict(
+    iterations=2000, depth=8, learning_rate=0.05,
+    verbose=0,
 )
 
 NEEDS_SCALING = {"SVM", "ANN", "NB"}
+
+# Models that can use GPU when available
+GPU_CAPABLE = {"XGBoost", "XGBoost-tuned", "XGBoost-CS", "LightGBM", "LightGBM-bal", "CatBoost"}

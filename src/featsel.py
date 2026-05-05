@@ -15,7 +15,9 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import RFE, mutual_info_classif
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
@@ -29,7 +31,7 @@ from .config import (
     MI_SUBSAMPLE, RANDOM_STATE,
 )
 
-FsMethod = Literal["all", "mi", "ga", "rfe"]
+FsMethod = Literal["all", "mi", "ga", "rfe", "mrmr", "boruta", "permutation"]
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +184,117 @@ def select_features(
     if method == "rfe":
         cols, ranking = select_rfe(X, y, k=k)
         return cols, {"method": "rfe", "n_selected": len(cols), "ranking": ranking}
+    if method == "mrmr":
+        cols, info = select_mrmr(X, y, k=k)
+        return cols, {"method": "mrmr", "n_selected": len(cols), **info}
+    if method == "boruta":
+        cols, info = select_boruta(X, y)
+        return cols, {"method": "boruta", "n_selected": len(cols), **info}
+    if method == "permutation":
+        cols, info = select_permutation(X, y, k=k)
+        return cols, {"method": "permutation", "n_selected": len(cols), **info}
     raise ValueError(f"Unknown FS method: {method!r}")
+
+
+# ---------------------------------------------------------------------------
+# mRMR (Peng, Long & Ding 2005) — minimum redundancy, maximum relevance
+# ---------------------------------------------------------------------------
+def select_mrmr(
+    X: pd.DataFrame, y: pd.Series, k: int | None = None,
+    sample_size: int = 100_000,
+) -> tuple[list[str], dict]:
+    if k is None:
+        k = max(1, X.shape[1] // 2)
+    try:
+        from mrmr import mrmr_classif
+    except ImportError as e:
+        raise RuntimeError("Install `mrmr-selection` to use mRMR feature selection") from e
+
+    if len(X) > sample_size:
+        X_s, y_s = sk_resample(
+            X, y, n_samples=sample_size, replace=False,
+            random_state=RANDOM_STATE, stratify=y,
+        )
+    else:
+        X_s, y_s = X, y
+    selected = mrmr_classif(X=X_s, y=y_s, K=k, show_progress=False)
+    return list(selected), {"k": k}
+
+
+# ---------------------------------------------------------------------------
+# Boruta (Kursa & Rudnicki 2010) — RF + shadow features
+# ---------------------------------------------------------------------------
+def select_boruta(
+    X: pd.DataFrame, y: pd.Series,
+    sample_size: int = 100_000,
+    n_estimators: int = 100,
+) -> tuple[list[str], dict]:
+    try:
+        from boruta import BorutaPy
+    except ImportError as e:
+        raise RuntimeError("Install `boruta` to use Boruta feature selection") from e
+
+    if len(X) > sample_size:
+        X_s, y_s = sk_resample(
+            X, y, n_samples=sample_size, replace=False,
+            random_state=RANDOM_STATE, stratify=y,
+        )
+    else:
+        X_s, y_s = X, y
+    rf = RandomForestClassifier(
+        n_estimators=n_estimators, n_jobs=-1, max_depth=10,
+        class_weight="balanced", random_state=RANDOM_STATE,
+    )
+    boruta = BorutaPy(
+        rf, n_estimators="auto", verbose=0, random_state=RANDOM_STATE, max_iter=50,
+    )
+    # BorutaPy expects numpy arrays
+    boruta.fit(X_s.values, y_s.values)
+    selected = [c for c, sup in zip(X.columns, boruta.support_) if sup]
+    if not selected:
+        # Fallback: tentative features (rank ≤ 2) so we never return zero
+        selected = [c for c, r in zip(X.columns, boruta.ranking_) if r <= 2]
+    if not selected:
+        # Final fallback: keep top-k by ranking
+        k = max(1, X.shape[1] // 2)
+        ranks = list(zip(X.columns, boruta.ranking_))
+        ranks.sort(key=lambda kv: kv[1])
+        selected = [c for c, _ in ranks[:k]]
+    ranking = {c: int(r) for c, r in zip(X.columns, boruta.ranking_)}
+    return selected, {"ranking": ranking}
+
+
+# ---------------------------------------------------------------------------
+# Permutation importance (Fisher, Rudin & Dominici 2019) — model-faithful
+# ---------------------------------------------------------------------------
+def select_permutation(
+    X: pd.DataFrame, y: pd.Series, k: int | None = None,
+    sample_size: int = 50_000,
+    n_repeats: int = 5,
+) -> tuple[list[str], dict]:
+    if k is None:
+        k = max(1, X.shape[1] // 2)
+
+    if len(X) > sample_size:
+        X_s, y_s = sk_resample(
+            X, y, n_samples=sample_size, replace=False,
+            random_state=RANDOM_STATE, stratify=y,
+        )
+    else:
+        X_s, y_s = X, y
+
+    rf = RandomForestClassifier(
+        n_estimators=100, max_depth=10, n_jobs=-1,
+        class_weight="balanced", random_state=RANDOM_STATE,
+    )
+    rf.fit(X_s, y_s)
+    perm = permutation_importance(
+        rf, X_s, y_s, n_repeats=n_repeats, random_state=RANDOM_STATE,
+        n_jobs=-1, scoring="roc_auc",
+    )
+    importances = pd.Series(perm.importances_mean, index=X.columns).sort_values(ascending=False)
+    selected = importances.head(k).index.tolist()
+    return selected, {"importances_top": importances.head(15).to_dict()}
 
 
 # ---------------------------------------------------------------------------

@@ -19,14 +19,35 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from imblearn.combine import SMOTEENN, SMOTETomek
-from imblearn.over_sampling import ADASYN, SMOTE
+from imblearn.over_sampling import ADASYN, SMOTE, SMOTENC
 from imblearn.under_sampling import RandomUnderSampler
 
 from .config import DUMMY_PREFIXES, RANDOM_STATE
 
 ImbalanceMethod = Literal[
-    "none", "smote", "adasyn", "smoteenn", "smotetomek", "undersample",
+    "none", "smote", "smote_nc", "adasyn", "smoteenn", "smotetomek", "undersample",
 ]
+
+
+# Heuristic: a column is "categorical" for SMOTE-NC if its name starts with one of
+# the dummy prefixes (one-hot output) OR ends with the missing-indicator suffix OR
+# is one of the documented binary-flag columns in BAF.
+BINARY_FLAGS = {
+    "has_other_cards", "foreign_request", "email_is_free",
+    "phone_home_valid", "phone_mobile_valid", "keep_alive_session",
+}
+
+
+def _categorical_indices(X: pd.DataFrame) -> list[int]:
+    cat = []
+    for i, col in enumerate(X.columns):
+        if col in BINARY_FLAGS:
+            cat.append(i)
+        elif col.endswith("_was_missing"):
+            cat.append(i)
+        elif any(col.startswith(p + "_") for p in DUMMY_PREFIXES):
+            cat.append(i)
+    return cat
 
 
 def _round_one_hot(X: pd.DataFrame, dummy_prefixes: list[str]) -> pd.DataFrame:
@@ -49,6 +70,9 @@ def resample(
 
     if method == "smote":
         sampler = SMOTE(random_state=RANDOM_STATE)
+    elif method == "smote_nc":
+        cat_idx = _categorical_indices(X)
+        sampler = SMOTENC(categorical_features=cat_idx, random_state=RANDOM_STATE)
     elif method == "adasyn":
         sampler = ADASYN(random_state=RANDOM_STATE)
     elif method == "smoteenn":
@@ -61,7 +85,8 @@ def resample(
         raise ValueError(f"Unknown imbalance method: {method!r}")
 
     X_res, y_res = sampler.fit_resample(X, y)
-    # Synthetic-oversamplers can produce non-binary dummy values — round them back
+    # SMOTE-family that interpolates can produce non-binary dummy values — round them back.
+    # SMOTE-NC handles categoricals natively by mode-vote, so no rounding needed.
     if dummy_prefixes and method in ("smote", "adasyn", "smoteenn", "smotetomek"):
         X_res = _round_one_hot(X_res, dummy_prefixes)
     return X_res, y_res
